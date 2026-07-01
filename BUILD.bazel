@@ -1,0 +1,288 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@sonic_build_infra//shared_library:shared_library.bzl", "sonic_shared_library")
+load("@sonic_build_infra//sonic_deb:sonic_deb.bzl", "sonic_deb")
+load("@sonic_build_infra//swig:defs.bzl", "swig_gen")
+
+package(default_visibility = ["//visibility:public"])
+
+VERSION = "1.0.0"
+
+# All 30 .proto files under proto/. `filegroup` publishes them for the two
+# codegen genrules below (protoc --cpp_out and --python_out).
+PROTO_FILES = glob(["proto/*.proto"])
+
+PROTO_BASENAMES = [
+    "acl_group",
+    "acl_in",
+    "acl_out",
+    "acl_rule",
+    "appliance",
+    "eni",
+    "eni_route",
+    "ha_scope",
+    "ha_scope_config",
+    "ha_scope_state",
+    "ha_set",
+    "ha_set_config",
+    "ha_set_state",
+    "meter",
+    "meter_policy",
+    "meter_rule",
+    "outbound_port_map",
+    "outbound_port_map_range",
+    "pa_validation",
+    "prefix_tag",
+    "qos",
+    "route",
+    "route_group",
+    "route_rule",
+    "route_type",
+    "routing_appliance",
+    "tunnel",
+    "types",
+    "vnet",
+    "vnet_mapping",
+]
+
+# -----------------------------------------------------------------------------
+# C++ protoc codegen. Mirrors Makefile compile_cpp_proto:
+#   protoc -I=proto --cpp_out=build --experimental_allow_proto3_optional
+#          proto/*.proto
+#
+# Uses @protobuf//:protoc directly instead of Bazel's proto_library +
+# cc_proto_library aspect, matching the reference sonic-bazel/BUILD approach
+# but avoiding the protobuf 29.0 cc_proto aspect that hangs analysis in this
+# workspace on the whole sonic-buildimage graph. protoc is invoked as a tool
+# (host cfg) and produces one .pb.h + .pb.cc per input.
+# -----------------------------------------------------------------------------
+genrule(
+    name = "cpp_proto_gen",
+    srcs = PROTO_FILES + ["@protobuf//:well_known_type_protos"],
+    outs = [f + ext for f in PROTO_BASENAMES for ext in [".pb.h", ".pb.cc"]],
+    tools = ["@protobuf//:protoc"],
+    # WKT_INC = dirname of the first WKT proto's `google/protobuf/` parent, i.e.
+    # `external/<protobuf-canonical-name>/src`. `execpaths` returns every file
+    # in the filegroup; awk grabs one, then a triple `dirname` lifts up to /src.
+    cmd = "WKT=$$(echo $(execpaths @protobuf//:well_known_type_protos) | awk '{print $$1}'); " +
+          "WKT_INC=$$(dirname $$(dirname $$(dirname $$WKT))); " +
+          "$(execpath @protobuf//:protoc) " +
+          "-I$$(dirname $(execpath proto/types.proto)) " +
+          "-I$$WKT_INC " +
+          "--cpp_out=$(RULEDIR) " +
+          "--experimental_allow_proto3_optional " +
+          " ".join(["$(execpath proto/{}.proto)".format(b) for b in PROTO_BASENAMES]),
+)
+
+# Split the genrule outputs into `.pb.h` (used as headers by consumers) and
+# `.pb.cc` (compiled into libdashapi.so). `srcs` on cc_library gets the .cc
+# files; `hdrs` gets the .h files, so downstream `#include "types.pb.h"`
+# resolves via strip_include_prefix = "".
+filegroup(
+    name = "cpp_proto_hdrs",
+    srcs = [b + ".pb.h" for b in PROTO_BASENAMES],
+)
+
+filegroup(
+    name = "cpp_proto_srcs",
+    srcs = [b + ".pb.cc" for b in PROTO_BASENAMES],
+)
+
+# The generated code #includes <google/protobuf/...> — provided by the
+# @protobuf runtime (protobuf 29.0 pulled from BCR).
+cc_library(
+    name = "dashapi_cpp_proto",
+    srcs = [":cpp_proto_srcs"],
+    hdrs = [":cpp_proto_hdrs"],
+    includes = ["."],
+    deps = ["@protobuf"],
+    linkstatic = False,
+)
+
+# -----------------------------------------------------------------------------
+# Python protoc codegen. Mirrors Makefile compile_py_proto:
+#   protoc -I=proto --python_out=misc/pypkg/dash_api \
+#          --pyi_out=misc/pypkg/dash_api \
+#          --experimental_allow_proto3_optional proto/*.proto
+#
+# Emits <name>_pb2.py + <name>_pb2.pyi. Both are shipped in the .deb under
+# /usr/lib/python3/dist-packages/dash_api/ (matching the Make install layout).
+# -----------------------------------------------------------------------------
+genrule(
+    name = "py_proto_gen",
+    srcs = PROTO_FILES + ["@protobuf//:well_known_type_protos"],
+    outs = [b + "_pb2.py" for b in PROTO_BASENAMES] +
+           [b + "_pb2.pyi" for b in PROTO_BASENAMES],
+    tools = ["@protobuf//:protoc"],
+    cmd = "WKT=$$(echo $(execpaths @protobuf//:well_known_type_protos) | awk '{print $$1}'); " +
+          "WKT_INC=$$(dirname $$(dirname $$(dirname $$WKT))); " +
+          "$(execpath @protobuf//:protoc) " +
+          "-I$$(dirname $(execpath proto/types.proto)) " +
+          "-I$$WKT_INC " +
+          "--python_out=$(RULEDIR) " +
+          "--pyi_out=$(RULEDIR) " +
+          "--experimental_allow_proto3_optional " +
+          " ".join(["$(execpath proto/{}.proto)".format(b) for b in PROTO_BASENAMES]),
+)
+
+filegroup(
+    name = "dashapi_py_proto",
+    srcs = [":py_proto_gen"],
+)
+
+# -----------------------------------------------------------------------------
+# libdashapi.so — the DASH API shared library.
+#
+# Mirrors Makefile `dashapi.so` target:
+#   g++ -std=c++14 -fPIC -shared -o build/libdashapi.so \
+#       build/*.pb.cc misc/*.cpp -lprotobuf
+#
+# The generated .pb.cc are provided by :dashapi_cpp_proto; misc/*.cpp are
+# compiled here. libprotobuf comes from the @protobuf module runtime.
+#
+# NOTE: misc/utils.cpp uses two protobuf-3.21 APIs that were removed in
+# protobuf 26+:
+#   - JsonPrintOptions::always_print_primitive_fields  (renamed 27+)
+#   - absl::string_view::as_string()                    (removed)
+# The Bazel runtime is protobuf 29.0 (sonic_rules pin), so a Bazel-only patch
+# rewrites these two lines in utils.cpp on-the-fly. The Make build (apt
+# libprotobuf-dev 3.21.12) is unaffected — the source in-tree is not edited.
+# -----------------------------------------------------------------------------
+genrule(
+    name = "utils_cpp_patched",
+    srcs = ["misc/utils.cpp"],
+    outs = ["misc/utils_patched.cpp"],
+    cmd = "sed " +
+          "-e 's/always_print_primitive_fields/always_print_fields_with_no_presence/g' " +
+          "-e 's|status.message().as_string()|std::string(status.message())|g' " +
+          "$(execpath misc/utils.cpp) > $@",
+)
+
+sonic_shared_library(
+    name = "dashapi",
+    srcs = [":utils_cpp_patched"],
+    hdrs = ["misc/utils.h"],
+    strip_include_prefix = "misc",
+    copts = [
+        # Bumped from Make's -std=c++14 to -std=c++17: the runtime protobuf 29
+        # headers use `absl::string_view`, which resolves to `std::string_view`
+        # only under C++17+. Compiling this TU with -std=c++14 mangles the
+        # `NewTypeResolverForDescriptorPool` / `JsonToBinaryString` calls with
+        # a C++14 fallback typedef and the linker can't resolve them against
+        # protobuf's C++17-compiled archives.
+        "-std=c++17",
+        "-g",
+        "-O2",
+    ],
+    deps = [
+        ":dashapi_cpp_proto",
+        "@protobuf",
+        "@protobuf//:json_util",
+        "@protobuf//:type_resolver",
+    ],
+)
+
+# -----------------------------------------------------------------------------
+# SWIG codegen for the Python bindings.
+#
+# Mirrors Makefile `swig` target:
+#   swig -c++ -python -py3 -outdir misc/pypkg/dash_api \
+#        -o build/utils_wrap.cpp misc/utils.i
+#
+# swig_gen emits both the C++ wrapper (.cpp) and the Python module (.py) as
+# declared outputs. The .cpp is compiled into _utils.so below; the .py is
+# packaged into the .deb next to _utils.so.
+# -----------------------------------------------------------------------------
+swig_gen(
+    name = "utils_swig",
+    interface = "misc/utils.i",
+    cpp_out = "misc/utils_wrap.cpp",
+    python_out = "misc/utils.py",
+    hdrs = ["misc/utils.h"],
+    defines = ["SWIG_PYTHON_STRICT_BYTE_CHAR"],
+)
+
+# -----------------------------------------------------------------------------
+# _utils.so — SWIG Python extension.
+#
+# Mirrors Makefile `swig` link step:
+#   g++ -shared -fPIC -I$(PYINCLUDE) -Imisc \
+#       -o misc/pypkg/dash_api/_utils.so \
+#       build/utils_wrap.cpp -Lmisc misc/utils.cpp build/*.pb.cc -lprotobuf
+#
+# Post-commit 1c038fd the Make link line intentionally does NOT link
+# libpython3.x. Python C extensions on Linux resolve PyXxx from the interpreter
+# at import time. current_py_cc_headers gives us Python.h from the hermetic
+# rules_python 3.13 toolchain (default toolchain in root MODULE.bazel).
+# allow_undefined = True lets the .so leave PyXxx symbols undefined, matching
+# the Make build.
+# -----------------------------------------------------------------------------
+sonic_shared_library(
+    name = "_utils",
+    srcs = [
+        "misc/utils_wrap.cpp",
+    ],
+    copts = [
+        # See :dashapi copts note — protobuf 29 abseil string_view mangling.
+        "-std=c++17",
+        "-g",
+        "-O2",
+    ],
+    output_name = "_utils",
+    allow_undefined = True,
+    deps = [
+        ":dashapi",
+        "@protobuf",
+        "@protobuf//:json_util",
+        "@protobuf//:type_resolver",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+# -----------------------------------------------------------------------------
+# libdashapi_1.0.0.deb — mirrors debian/control (Package: libdashapi) plus
+# the install layout defined in Makefile `install`:
+#
+#   /usr/bin/dash_api_utils
+#   /usr/include/dash_api/*.h        (utils.h + generated *.pb.h)
+#   /usr/lib/libdashapi.so
+#   /usr/lib/python3/dist-packages/dash_api/__init__.py
+#   /usr/lib/python3/dist-packages/dash_api/utils.py
+#   /usr/lib/python3/dist-packages/dash_api/_utils.so
+#   /usr/lib/python3/dist-packages/dash_api/*_pb2.py + *_pb2.pyi
+#
+# libdashapi.so and _utils.so are ARCHITECTURE-INDEPENDENT install paths
+# (/usr/lib and /usr/lib/python3/dist-packages), matching the original Makefile
+# — dash_api does NOT drop into the multiarch (x86_64-linux-gnu / aarch64-linux-gnu)
+# directory.
+# -----------------------------------------------------------------------------
+sonic_deb(
+    name = "libdashapi_{}.deb".format(VERSION),
+    package = "libdashapi",
+    version = VERSION,
+    section = "libs",
+    content = {
+        "/usr/bin:*:0755": ["misc/dash_api_utils"],
+        "/usr/include/dash_api:*:0644": [
+            ":cpp_proto_hdrs",
+            "misc/utils.h",
+        ],
+        "/usr/lib:*:0644": [":dashapi_shared"],
+        "/usr/lib/python3/dist-packages/dash_api:*:0644": [
+            ":dashapi_py_proto",
+            ":_utils_shared",
+            "misc/utils.py",
+            "misc/pypkg/dash_api/__init__.py",
+        ],
+    },
+    depends = [
+        # Mirrors what dpkg-shlibdeps generates in the Make recipe for the
+        # protobuf runtime on trixie (protobuf 29.x -> libprotobuf32t64).
+        "libprotobuf32t64",
+        "libc6",
+        "libstdc++6",
+    ],
+    description = "DASH API definition for the SONiC project",
+    maintainer = "SONiC Maintainers",
+    gen_dbg = True,
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,6 @@
+# Bazel-only patches applied during build to bridge protobuf/absl API gaps
+# between the SONiC bookworm/bullseye Make build (apt libprotobuf-dev 3.21) and
+# the SONiC trixie Bazel runtime (sonic_rules protobuf 29.0). Patches are not
+# committed to the sonic-dash-api submodule's own history — they live only in
+# the sonic-buildimage tree that consumes it.
+exports_files(glob(["*.patch"]))

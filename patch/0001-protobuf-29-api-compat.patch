@@ -1,0 +1,44 @@
+Subject: [PATCH] Adapt utils.cpp to protobuf 29+ API
+
+The Bazel-side runtime (sonic_rules/protobuf) ships libprotobuf32 built from
+protobuf 29.0.0 which:
+  1. Renamed JsonPrintOptions::always_print_primitive_fields to
+     ::always_print_fields_with_no_presence (protobuf 27+).
+  2. Removed absl::string_view::as_string(); use std::string(view) directly.
+
+The Make build compiles against apt libprotobuf-dev 3.21.12 (pre-26) where
+these APIs still exist. The .cc source is not modified in-tree; this patch is
+applied on-the-fly by a Bazel genrule during compilation only.
+---
+ misc/utils.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/misc/utils.cpp b/misc/utils.cpp
+--- a/misc/utils.cpp
++++ b/misc/utils.cpp
+@@ -70,13 +70,13 @@ string PbBinaryToJsonString(const string &table_name, const string &binary) {
+     auto url = TableNameToTypeUrl(table_name);
+     util::JsonPrintOptions options;
+     options.add_whitespace = true;
+-    options.always_print_primitive_fields = true;
++    options.always_print_fields_with_no_presence = true;
+     options.preserve_proto_field_names = true;
+     string json;
+ 
+     // Parse the message type
+     auto status = util::BinaryToJsonString(resolver.get(), url, binary, &json, options);
+     if (!status.ok()) {
+-        throw runtime_error(status.message().as_string());
++        throw runtime_error(std::string(status.message()));
+     }
+ 
+     return json;
+@@ -92,7 +92,7 @@ string JsonStringToPbBinary(const string &table_name, const string &json) {
+     string binary;
+     auto status = util::JsonToBinaryString(resolver.get(), url, json, &binary, options);
+     if (!status.ok()) {
+-        throw runtime_error(status.message().as_string());
++        throw runtime_error(std::string(status.message()));
+     }
+ 
+     return binary;

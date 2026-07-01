@@ -8,3 +8,11 @@ debian/debhelper-build-stamp
 debian/files
 debian/libdashapi.substvars
 debian/libdashapi
+
+# Bazel migration artifacts — always kept so Bazel builds work when the
+# sonic-buildimage parent tree consumes this submodule.
+!BUILD.bazel
+!MODULE.bazel
+!patch/
+!patch/*.patch
+!patch/BUILD.bazel

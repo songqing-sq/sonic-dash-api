@@ -1,0 +1,20 @@
+module(
+    name = "sonic-dash-api",
+    version = "1.0.0",
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.16")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "sonic-build-infra", version = "0.0.0", repo_name = "sonic_build_infra")
+bazel_dep(name = "protobuf", version = "29.0")
+bazel_dep(name = "swig", version = "4.1.0")
+bazel_dep(name = "rules_python", version = "1.7.0")
+
+# Python.h for the SWIG-generated _utils.so comes from rules_python's hermetic
+# Python toolchain via @rules_python//python/cc:current_py_cc_headers, which
+# resolves to the default 3.13 toolchain registered in the root MODULE.bazel
+# (matching trixie's system Python 3.13.x ABI). We do NOT depend on
+# libpython3.x-dev via apt: (a) trixie main does not ship libpython3.11-dev,
+# and (b) upstream commit 1c038fd removed the explicit -lpython linkage from
+# _utils.so, so the extension resolves PyXxx symbols from the interpreter at
+# import time and does not need libpython on the shared-library link line.
