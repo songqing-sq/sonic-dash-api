@@ -93,9 +93,11 @@ cc_library(
     name = "dashapi_cpp_proto",
     srcs = [":cpp_proto_srcs"],
     hdrs = [":cpp_proto_hdrs"],
+    include_prefix = "dash_api",
     includes = ["."],
     deps = ["@protobuf"],
     linkstatic = False,
+    visibility = ["//visibility:public"],
 )
 
 # -----------------------------------------------------------------------------
