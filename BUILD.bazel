@@ -175,6 +175,17 @@ sonic_shared_library(
         "-g",
         "-O2",
     ],
+    # protobuf runtime is linked dynamically via libprotobuf_shared so that
+    # downstream binaries linking both dashapi_shared and libprotobuf_shared
+    # don't double-link protobuf/abseil statically. The @protobuf cc_library
+    # deps remain for compile-time headers; their symbols stay UND and are
+    # resolved by libprotobuf.so at runtime.
+    dynamic_deps = ["@sonic_build_infra//protobuf:libprotobuf_shared"],
+    exports_filter = [
+        "@@protobuf+//:__subpackages__",
+        "@@abseil-cpp+//:__subpackages__",
+        "@@sonic-dash-api+//:__subpackages__",
+    ],
     deps = [
         ":dashapi_cpp_proto",
         "@protobuf",
@@ -279,9 +290,10 @@ sonic_deb(
     depends = [
         # Mirrors what dpkg-shlibdeps generates in the Make recipe for the
         # protobuf runtime on trixie (protobuf 29.x -> libprotobuf32t64).
-        "libprotobuf32t64",
-        "libc6",
-        "libstdc++6",
+        "libc6 (>= 2.32)",
+        "libgcc-s1 (>= 3.0)",
+        "libprotobuf32t64 (>= 3.21.12)",
+        "libstdc++6 (>= 14)",
     ],
     description = "DASH API definition for the SONiC project",
     maintainer = "SONiC Maintainers",
